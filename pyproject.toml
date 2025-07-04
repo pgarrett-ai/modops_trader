@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "modops-trader"
+version = "0.1.0"
+description = "Lightweight trading agent scaffold."
+readme = "README.md"
+authors = [{name = "Codex"}]
+requires-python = ">=3.11"
+dependencies = [
+    "pandas",
+    "numpy",
+    "torch>=2.0",
+    "yfinance",
+    "scipy",
+]
+
+[project.optional-dependencies]
+development = [
+    "pytest",
+    "black",
+    "isort",
+    "pre-commit",
+]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
