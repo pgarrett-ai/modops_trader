@@ -3,7 +3,6 @@ modops_trader.vector_store
 
 Week-1 scaffold for the lightweight trading agent.
 
-Author: Codex — generated scaffold.
 """
 
 from __future__ import annotations
