@@ -1,5 +1,5 @@
 """
-modops_trader.data_adapter   • production-ready
+modops_trader.data_adapter   • production-ready (retry & tz-aware)
 
 Streams or back-fills market data, computes fluid-style features, and
 hands the results to downstream ingestion pipelines.
@@ -21,15 +21,16 @@ import numpy as np
 import pandas as pd
 import yaml
 from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential   # :contentReference[oaicite:7]{index=7}
-import yfinance as yf                                              # :contentReference[oaicite:8]{index=8}
+from tenacity import retry, stop_after_attempt, wait_exponential
+import yfinance as yf
 
 # Optional Schwab import (fails gracefully in test environments)
 try:
     from schwab.client import Client as SchwabClient
     from schwab.streaming import StreamClient
-except ModuleNotFoundError:                                        # unit-tests / CI
-    SchwabClient = StreamClient = None                             # type: ignore
+except ModuleNotFoundError:
+    SchwabClient = StreamClient = None  # type: ignore
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -64,11 +65,12 @@ class AdapterSettings(BaseModel):
 class DataAdapter:
     """Orchestrates streaming, feature computation, and history back-fill."""
 
+    # default retry settings pulled from YAML defaults at import-time
+    _DEFAULT_RETRIES: int = AdapterSettings().retry_attempts
+    _DEFAULT_MAX_BACKOFF: int = AdapterSettings().max_backoff
+
     def __init__(self, cfg: AdapterSettings) -> None:
         self.cfg = cfg
-        self._rng = np.random.default_rng(seed=0)
-
-        # Attempt Schwab; fall back to yfinance
         key, secret = os.getenv("SW_APP_KEY"), os.getenv("SW_APP_SECRET")
         if key and secret and SchwabClient:
             logger.info("✅ Using Charles Schwab streaming API")
@@ -86,7 +88,7 @@ class DataAdapter:
         start = time.time()
 
         async for msg in self._stream.stream():
-            ts = pd.Timestamp.utcnow()
+            ts = pd.Timestamp.now(tz="UTC")  # tz-aware timestamp
             q, depth = msg.get("quote", {}), msg.get("bookDepth", [])
             row = pd.DataFrame(
                 {
@@ -128,46 +130,51 @@ class DataAdapter:
             ).iloc[[-1]]
             df["Bid"] = df["Close"] * 0.999
             df["Ask"] = df["Close"] * 1.001
+            df.index = df.index.tz_localize("UTC")  # tz-aware index
             yield self._compute_features(df)
             time.sleep(1)
 
     # ------------  HISTORICAL  ----------------------------------------------
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, max=30),
+        stop=stop_after_attempt(_DEFAULT_RETRIES),
+        wait=wait_exponential(multiplier=1, max=_DEFAULT_MAX_BACKOFF),
         reraise=True,
     )
     def _fetch_historical_one(self, symbol: str) -> pd.DataFrame:
         end = dt.date.today()
         start = end - dt.timedelta(days=365 * self.cfg.backfill_years)
+        # Primary: Schwab historical API
         if self._use_schwab:
             try:
                 df = self._cli.get_historical(
                     symbol, start.isoformat(), end.isoformat(), interval="1d"
                 )
-                logger.info("Schwab historical ✓ %s", symbol)
-                return pd.DataFrame(df)
-            except Exception as ex:  # noqa: BLE001
-                logger.warning("Schwab historical failed %s → %s", symbol, ex)
-        # Yahoo fallback (1m ≤ 7 days) :contentReference[oaicite:9]{index=9}
-        df_day = yf.download(symbol, start=start, end=end, interval="1d", progress=False)
-        df_min = yf.download(symbol, period="7d", interval="1m", progress=False)
-        return pd.concat([df_day, df_min]).drop_duplicates().sort_index()
+                logger.info("🗂  Schwab historical ✓ %s", symbol)
+                df = pd.DataFrame(df)
+            except Exception as ex:
+                logger.warning("⚠️  Schwab failed %s → %s; falling back", symbol, ex)
+                df = yf.download(symbol, start=start, end=end, interval="1d", progress=False)
+        else:
+            df = yf.download(symbol, start=start, end=end, interval="1d", progress=False)
+
+        df.index = df.index.tz_localize("UTC")  # tz-aware index
+        return df
 
     def backfill_all(self) -> dict[str, pd.DataFrame]:
+        """Backfill each symbol’s history as a DataFrame."""
         return {s: self._fetch_historical_one(s) for s in self.cfg.symbols}
 
     # ------------  FEATURE ENGINEERING  -------------------------------------
     def _compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         close = df["Close"].squeeze()
         log_ret = np.log(close).diff().fillna(0.0)
-        ewma_vol = log_ret.ewm(span=20).std().fillna(0.0)     # EWMA volatility :contentReference[oaicite:10]{index=10}
+        ewma_vol = log_ret.ewm(span=20).std().fillna(0.0)
         imbalance = (df["Depth"].apply(len) / self.cfg.depth).clip(0, 1)
         reynolds = log_ret.abs() / (ewma_vol + 1e-6)
         vorticity = log_ret.diff().fillna(0.0)
         dissipation = log_ret.pow(2)
 
-        feats = pd.DataFrame(
+        return pd.DataFrame(
             {
                 "log_ret": log_ret,
                 "ewma_vol": ewma_vol,
@@ -178,4 +185,3 @@ class DataAdapter:
             },
             index=df.index,
         )
-        return feats
