@@ -1,13 +1,26 @@
 """
 modops_trader
 
-Week-1 scaffold for the lightweight trading agent.
+Lightweight trading agent package initialization.
 
-Author: Codex — generated scaffold.
+Author: Phillip Garrett
+Last updated: 2025-07-07
 """
 
+import sys
+from pathlib import Path
+
+# ── Make D:/modops_kb/vector_store importable under WSL ────────────────
+sys.path.insert(0, "/mnt/d/modops_kb")
+
+# ── Core adapter and DataFrame alias ──────────────────────────────────
 from .data_adapter import DataAdapter, FeatureFrame
-from .vector_store import SimpleVectorStore
 
-__all__ = ["DataAdapter", "FeatureFrame", "SimpleVectorStore"]
+# ── Relocated VectorStore ─────────────────────────────────────────────
+from vector_store.vector_store import VectorStore  # type: ignore
 
+__all__ = [
+    "DataAdapter",
+    "FeatureFrame",
+    "VectorStore",
+]
