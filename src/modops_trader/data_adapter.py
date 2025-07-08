@@ -1,191 +1,181 @@
 """
-modops_trader.data_adapter
+modops_trader.data_adapter   • production-ready
 
-Fetch tick data via Charles Schwab WebSocket or yfinance fallback,
-compute fluid-style features, and backfill multi-year history.
+Streams or back-fills market data, computes fluid-style features, and
+hands the results to downstream ingestion pipelines.
 
-Author: pgrrt
+Author: pgarrett  • Last updated: 2025-07-07
 """
 
 from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import logging
 import os
 import time
-import asyncio
-import logging
-import datetime
-from dataclasses import dataclass
-from typing import Iterator, AsyncIterator, List
+from pathlib import Path
+from typing import AsyncIterator, Iterator, List
 
 import numpy as np
 import pandas as pd
-import yfinance as yf  # fallback data source 
-from tenacity import retry, stop_after_attempt, wait_exponential  # retry logic 
+import yaml
+from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential   # :contentReference[oaicite:7]{index=7}
+import yfinance as yf                                              # :contentReference[oaicite:8]{index=8}
 
-# Schwabdev imports
-from schwab.client import Client as SchwabClient  # core API client 
-from schwab.streaming import StreamClient         # websockets feed 
+# Optional Schwab import (fails gracefully in test environments)
+try:
+    from schwab.client import Client as SchwabClient
+    from schwab.streaming import StreamClient
+except ModuleNotFoundError:                                        # unit-tests / CI
+    SchwabClient = StreamClient = None                             # type: ignore
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-logger.addHandler(handler)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
-FeatureFrame = pd.DataFrame
 
-
-@dataclass(frozen=True)
-class AdapterConfig:
-    symbols: List[str]
+# ---------------------------------------------------------------------------#
+# 1.  Configuration (YAML → Pydantic)                                        #
+# ---------------------------------------------------------------------------#
+class AdapterSettings(BaseModel):
+    symbols: List[str] = Field(..., description="Tickers to subscribe to")
     depth: int = 5
     backfill_years: int = 6
     retry_attempts: int = 3
-    max_backoff: int = 30  # seconds
+    max_backoff: int = 30              # seconds
+    kb_root: Path = Path("D:/modops_kb")
+    parquet_engine: str = "pyarrow"
+    parquet_compress: str = "zstd"
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "AdapterSettings":
+        with open(path, "r", encoding="utf-8") as fh:
+            return cls(**yaml.safe_load(fh))
 
 
+# ---------------------------------------------------------------------------#
+# 2.  Main adapter object                                                    #
+# ---------------------------------------------------------------------------#
 class DataAdapter:
-    """Orchestrates streaming, feature computation, and history backfill."""
+    """Orchestrates streaming, feature computation, and history back-fill."""
 
-    def __init__(self, cfg: AdapterConfig) -> None:
-        self._cfg = cfg
-        key = os.getenv("SW_APP_KEY", "")
-        secret = os.getenv("SW_APP_SECRET", "")
+    def __init__(self, cfg: AdapterSettings) -> None:
+        self.cfg = cfg
+        self._rng = np.random.default_rng(seed=0)
+
+        # Attempt Schwab; fall back to yfinance
+        key, secret = os.getenv("SW_APP_KEY"), os.getenv("SW_APP_SECRET")
         if key and secret and SchwabClient:
-            logger.info("Using Charles Schwab API")  # :contentReference[oaicite:9]{index=9}
-            self._client = SchwabClient(key, secret)
-            self._stream = StreamClient(self._client)
+            logger.info("✅ Using Charles Schwab streaming API")
+            self._cli = SchwabClient(key, secret)
+            self._stream = StreamClient(self._cli)
             self._use_schwab = True
         else:
-            logger.info("Falling back to yfinance")  # :contentReference[oaicite:10]{index=10}
+            logger.warning("⚠️  Falling back to yfinance polling")
             self._use_schwab = False
 
-        np.random.seed(0)
-
-    async def _stream_schwab(self, duration: int) -> AsyncIterator[FeatureFrame]:
-        """Async generator: subscribe & yield features per tick."""
+    # ------------  STREAMING  ------------------------------------------------
+    async def _a_stream_schwab(self, duration: int) -> AsyncIterator[pd.DataFrame]:
         await self._stream.login()
-        # subscribe to quotes + book depth
-        await self._stream.subscribe(
-            self._cfg.symbols,
-            fields=["quote", "bookDepth"]
-        )
+        await self._stream.subscribe(self.cfg.symbols, fields=["quote", "bookDepth"])
         start = time.time()
+
         async for msg in self._stream.stream():
-            now = pd.Timestamp.now()
-            q = msg.get("quote", {})
-            depth = msg.get("bookDepth", [])
-            # build a single-row DataFrame
-            df = pd.DataFrame(
+            ts = pd.Timestamp.utcnow()
+            q, depth = msg.get("quote", {}), msg.get("bookDepth", [])
+            row = pd.DataFrame(
                 {
-                    "Open":   [q.get("last")],
-                    "High":   [q.get("last")],
-                    "Low":    [q.get("last")],
-                    "Close":  [q.get("last")],
-                    "Bid":    [q.get("bid")],
-                    "Ask":    [q.get("ask")],
-                    "Depth":  [depth[: self._cfg.depth]]
+                    "Open": [q.get("last")],
+                    "High": [q.get("last")],
+                    "Low": [q.get("last")],
+                    "Close": [q.get("last")],
+                    "Bid": [q.get("bid")],
+                    "Ask": [q.get("ask")],
+                    "Depth": [depth[: self.cfg.depth]],
                 },
-                index=[now],
+                index=[ts],
             )
-            yield self.compute_features(df)
+            yield self._compute_features(row)
+
             if time.time() - start > duration:
                 break
 
-    def stream_features(self, duration: int = 60) -> Iterator[FeatureFrame]:
-        """Synchronous wrapper around async stream or HTTP polling."""
+    def stream_features(self, duration: int = 60) -> Iterator[pd.DataFrame]:
+        """Sync wrapper so ingestion scripts can `for df in adapter.stream_features()`."""
         if self._use_schwab:
-            loop = asyncio.get_event_loop()
-            agen = self._stream_schwab(duration)
-            return loop.run_until_complete(_collect_async(agen))
-        else:
-            return self._poll_yfinance(duration)
+            return asyncio.run(self._collect_async(duration))
+        return self._poll_yfinance(duration)
 
-    def _poll_yfinance(self, duration: int) -> Iterator[FeatureFrame]:
-        """HTTP-poll last‐row every second from yfinance."""
+    async def _collect_async(self, duration: int) -> List[pd.DataFrame]:
+        out: List[pd.DataFrame] = []
+        async for df in self._a_stream_schwab(duration):
+            out.append(df)
+        return out
+
+    def _poll_yfinance(self, duration: int) -> Iterator[pd.DataFrame]:
         end = time.time() + duration
         while time.time() < end:
             df = yf.download(
-                tickers=self._cfg.symbols,
+                tickers=self.cfg.symbols,
                 period="1d",
                 interval="1m",
                 progress=False,
-            )
-            row = df.iloc[[-1]]
-            row["Bid"] = row["Close"] * 0.999
-            row["Ask"] = row["Close"] * 1.001
-            yield self.compute_features(row)
-            time.sleep(1.0)
+            ).iloc[[-1]]
+            df["Bid"] = df["Close"] * 0.999
+            df["Ask"] = df["Close"] * 1.001
+            yield self._compute_features(df)
+            time.sleep(1)
 
+    # ------------  HISTORICAL  ----------------------------------------------
     @retry(
-        stop=stop_after_attempt(AdapterConfig.retry_attempts),
-        wait=wait_exponential(multiplier=1, max=AdapterConfig.max_backoff),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=30),
         reraise=True,
     )
-    def fetch_historical(self, symbol: str) -> pd.DataFrame:
-        """Fetch historical bars up to backfill_years."""
-        end = datetime.date.today()
-        start = end - datetime.timedelta(days=365 * self._cfg.backfill_years)
+    def _fetch_historical_one(self, symbol: str) -> pd.DataFrame:
+        end = dt.date.today()
+        start = end - dt.timedelta(days=365 * self.cfg.backfill_years)
         if self._use_schwab:
             try:
-                df = self._client.get_historical(
+                df = self._cli.get_historical(
                     symbol, start.isoformat(), end.isoformat(), interval="1d"
                 )
-                logger.info("Schwab historical OK for %s", symbol)
+                logger.info("Schwab historical ✓ %s", symbol)
                 return pd.DataFrame(df)
-            except Exception:
-                logger.warning("Schwab historical failed for %s; falling back", symbol)
-        # Yahoo intraday limit: 1m for last 7 days, <1d for 60 days 
-        df_daily = yf.download(symbol, start=start, end=end, interval="1d", progress=False)
-        df_minute = yf.download(symbol, period="7d", interval="1m", progress=False)
-        return pd.concat([df_daily, df_minute]).drop_duplicates().sort_index()
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("Schwab historical failed %s → %s", symbol, ex)
+        # Yahoo fallback (1m ≤ 7 days) :contentReference[oaicite:9]{index=9}
+        df_day = yf.download(symbol, start=start, end=end, interval="1d", progress=False)
+        df_min = yf.download(symbol, period="7d", interval="1m", progress=False)
+        return pd.concat([df_day, df_min]).drop_duplicates().sort_index()
 
     def backfill_all(self) -> dict[str, pd.DataFrame]:
-        """One-time multi‐symbol stock/ETF backfill."""
-        history = {}
-        for s in self._cfg.symbols:
-            history[s] = self.fetch_historical(s)
-        return history
+        return {s: self._fetch_historical_one(s) for s in self.cfg.symbols}
 
-    def backfill_options(self, symbol: str) -> pd.DataFrame:
-        """Fetch current option chain; true historical not available."""
-        tk = yf.Ticker(symbol)
-        chains = []
-        for exp in tk.options:
-            calls = tk.option_chain(exp).calls.assign(expiration=exp)
-            puts  = tk.option_chain(exp).puts.assign(expiration=exp)
-            chains.append(pd.concat([calls, puts]))
-        df = pd.concat(chains)
-        logger.warning("Live-only options chain for %s; historical unsupported", symbol)
-        return df
-
-    def compute_features(self, df: pd.DataFrame) -> FeatureFrame:
-        """Compute log-ret, EWMA vol, imbalance, Reynolds, vorticity, dissipation."""
+    # ------------  FEATURE ENGINEERING  -------------------------------------
+    def _compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         close = df["Close"].squeeze()
         log_ret = np.log(close).diff().fillna(0.0)
-        ewma_vol = log_ret.ewm(span=20).std().fillna(0.0)
-        imbalance = (df["Depth"].apply(len).fillna(0) / self._cfg.depth).clip(0,1)
+        ewma_vol = log_ret.ewm(span=20).std().fillna(0.0)     # EWMA volatility :contentReference[oaicite:10]{index=10}
+        imbalance = (df["Depth"].apply(len) / self.cfg.depth).clip(0, 1)
         reynolds = log_ret.abs() / (ewma_vol + 1e-6)
         vorticity = log_ret.diff().fillna(0.0)
         dissipation = log_ret.pow(2)
+
         feats = pd.DataFrame(
             {
-                "log_ret":    log_ret,
-                "ewma_vol":   ewma_vol,
-                "imbalance":  imbalance,
-                "reynolds":   reynolds,
-                "vorticity":  vorticity,
+                "log_ret": log_ret,
+                "ewma_vol": ewma_vol,
+                "imbalance": imbalance,
+                "reynolds": reynolds,
+                "vorticity": vorticity,
                 "dissipation": dissipation,
             },
             index=df.index,
         )
         return feats
-
-
-def _collect_async(agen: AsyncIterator[FeatureFrame]) -> List[FeatureFrame]:
-    """Helper: collect async generator into list."""
-    items = []
-    async def _run():
-        async for x in agen:
-            items.append(x)
-        return items
-    return asyncio.get_event_loop().run_until_complete(_run())
