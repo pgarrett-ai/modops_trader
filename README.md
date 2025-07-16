@@ -1,6 +1,6 @@
 # modops_trader
 
-Week-1 scaffold for the lightweight trading agent.
+Modular lightweight trading agent.
 
 ## Setup
 
