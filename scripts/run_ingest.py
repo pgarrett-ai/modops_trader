@@ -2,12 +2,13 @@
 Run tick ingestion and feature streaming.
 """
 
-from modops_trader import DataAdapter
+from modops_trader.data_adapter import AdapterSettings, DataAdapter
 
 
 def main() -> None:
-    adapter = DataAdapter("AAPL")
-    for features in adapter.stream_features(duration=60, sleep_s=5):
+    settings = AdapterSettings(symbols=["AAPL"])
+    adapter = DataAdapter(settings)
+    for features in adapter.stream_features(duration=60):
         print(features.tail(1))
 
 

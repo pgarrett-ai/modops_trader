@@ -1,0 +1,4 @@
+api_url: https://api.schwabapi.com/trader/v1
+market_data_url: https://api.schwabapi.com/marketdata/v1
+callback_url: https://127.0.0.1:8182
+client_id: prod-pgarrett08gmailcom-129d4c29-ecc3-440e-8ea6-9dd1de2acfd6

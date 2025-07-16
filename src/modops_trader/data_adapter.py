@@ -1,10 +1,8 @@
 """
-modops_trader.data_adapter   • production-ready (fixed defaults + FeatureFrame alias)
+modops_trader.data_adapter   • production-ready (logging & tz-aware)
 
 Streams or back-fills market data, computes fluid-style features, and
 hands the results to downstream ingestion pipelines.
-
-Author: pgarrett  • Last updated: 2025-07-07
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import yfinance as yf
 
 # ────────────────────────────────────────────────────────────────────────────
-# 1.  Load global config for retry/backoff defaults (avoid empty Model init)
+# 1.  Load global config for retry/backoff defaults
 # ────────────────────────────────────────────────────────────────────────────
 _CONFIG_PATH = Path("/mnt/d/modops_kb/configs/adapter.yaml")
 with open(_CONFIG_PATH, "r", encoding="utf-8") as _fh:
@@ -35,19 +33,18 @@ GLOBAL_SYMBOLS      = _GLOBAL_CFG_DICT["symbols"]
 GLOBAL_RETRY_COUNT  = _GLOBAL_CFG_DICT.get("retry_attempts", 3)
 GLOBAL_MAX_BACKOFF  = _GLOBAL_CFG_DICT.get("max_backoff", 30)
 
-
 # ────────────────────────────────────────────────────────────────────────────
 # 2.  Configuration (YAML → Pydantic)
 # ────────────────────────────────────────────────────────────────────────────
 class AdapterSettings(BaseModel):
-    symbols:       List[str] = Field(..., description="Tickers to subscribe to")
-    depth:         int       = 8
-    backfill_years: int      = 6
-    retry_attempts:int       = 3
-    max_backoff:   int       = 30  # seconds
-    kb_root:       Path      = Path("/mnt/d/modops_kb")
-    parquet_engine:str      = "pyarrow"
-    parquet_compress:str    = "zstd"
+    symbols:        List[str] = Field(..., description="Tickers to subscribe to")
+    depth:          int       = 8
+    backfill_years: int       = 6
+    retry_attempts: int       = GLOBAL_RETRY_COUNT
+    max_backoff:    int       = GLOBAL_MAX_BACKOFF  # seconds
+    kb_root:        Path      = Path("/mnt/d/modops_kb")
+    parquet_engine: str       = "pyarrow"
+    parquet_compress: str     = "zstd"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "AdapterSettings":
@@ -55,21 +52,22 @@ class AdapterSettings(BaseModel):
             data = yaml.safe_load(fh)
         return cls(**data)
 
-
 # ────────────────────────────────────────────────────────────────────────────
-# 3.  Main adapter object
+# 3.  Logger setup (fixed format)
 # ────────────────────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(Y%m%d %H:%M:%S) %(levelname)s %(name)s - %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    datefmt="%Y%m%d %H:%M:%S",
 )
 
-
+# ────────────────────────────────────────────────────────────────────────────
+# 4.  Main adapter object
+# ────────────────────────────────────────────────────────────────────────────
 class DataAdapter:
     """Orchestrates streaming, feature computation, and history back-fill."""
 
-    # use real values from the loaded YAML
     _DEFAULT_RETRIES     = GLOBAL_RETRY_COUNT
     _DEFAULT_MAX_BACKOFF = GLOBAL_MAX_BACKOFF
 
@@ -85,10 +83,10 @@ class DataAdapter:
                 self._stream = StreamClient(self._cli)
                 self._use_schwab = True
             except ImportError:
-                logger.warning("⚠️ Schwab SDK missing—falling back")
+                logger.warning("⚠️ Schwab SDK missing—falling back to yfinance")
                 self._use_schwab = False
         else:
-            logger.warning("⚠️  No Schwab creds—falling back to yfinance polling")
+            logger.warning("⚠️ No Schwab creds—falling back to yfinance polling")
             self._use_schwab = False
 
     # ── STREAMING ─────────────────────────────────────────────────────────────
@@ -154,7 +152,7 @@ class DataAdapter:
                     symbol, start.isoformat(), end.isoformat(), interval="1d"
                 )
                 df = pd.DataFrame(df)
-                logger.info("🗂  Schwab historical ✓ %s", symbol)
+                logger.info("🗂 Schwab historical ✓ %s", symbol)
             except Exception as e:
                 logger.warning("❌ Schwab failed %s: %s", symbol, e)
                 df = yf.download(symbol, start=start, end=end, interval="1d", progress=False)
@@ -169,7 +167,7 @@ class DataAdapter:
 
     # ── FEATURE ENGINEERING ─────────────────────────────────────────────────
     def _compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        close       = df["Close"].squeeze()
+        close       = df["Close"]
         log_ret     = np.log(close).diff().fillna(0.0)
         ewma_vol    = log_ret.ewm(span=20).std().fillna(0.0)
         imbalance   = (df["Depth"].apply(len) / self.cfg.depth).clip(0,1)
@@ -178,11 +176,11 @@ class DataAdapter:
         dissipation = log_ret.pow(2)
 
         return pd.DataFrame({
-            "log_ret":     log_ret,
-            "ewma_vol":    ewma_vol,
-            "imbalance":   imbalance,
-            "reynolds":    reynolds,
-            "vorticity":   vorticity,
+            "log_ret":   log_ret,
+            "ewma_vol":  ewma_vol,
+            "imbalance": imbalance,
+            "reynolds":  reynolds,
+            "vorticity": vorticity,
             "dissipation": dissipation,
         }, index=df.index)
 

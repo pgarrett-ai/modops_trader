@@ -77,3 +77,11 @@ class VolSurfacePINN:
             opt.step()
         return float(loss.detach().cpu().item())
 
+
+if __name__ == "__main__":
+    pinn = VolSurfacePINN()
+    strikes = np.linspace(80, 120, 10)
+    maturities = np.linspace(0.1, 1, 10)
+    vols = 0.2 * np.ones_like(strikes)
+    loss = pinn.fit(strikes, maturities, vols)
+    print(f"Loss: {loss:.4f}")
