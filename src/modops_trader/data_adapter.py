@@ -22,6 +22,9 @@ from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 import yfinance as yf
 
+from schwab.auth import easy_client
+from schwab.streaming import StreamClient
+
 # ────────────────────────────────────────────────────────────────────────────
 # 1.  Load global config for retry/backoff defaults
 # ────────────────────────────────────────────────────────────────────────────
@@ -73,17 +76,33 @@ class DataAdapter:
 
     def __init__(self, cfg: AdapterSettings) -> None:
         self.cfg = cfg
-        key, secret = os.getenv("SW_APP_KEY"), os.getenv("SW_APP_SECRET")
+
+        key    = os.getenv("SW_APP_KEY")
+        secret = os.getenv("SW_APP_SECRET")
+        # Allow override via env, else default to localhost callback and a user‐home token path
+        callback_url = os.getenv("SW_CALLBACK_URL", "https://127.0.0.1:8182")
+        token_path   = os.getenv(
+            "SW_TOKEN_PATH",
+            str(Path.home() / ".schwab" / "token.json")
+        )
+
         if key and secret:
             try:
-                from schwab.client import Client as SchwabClient
-                from schwab.streaming import StreamClient
                 logger.info("✅ Using Schwab streaming API")
-                self._cli    = SchwabClient(key, secret)
+                # Use easy_client to get a properly authenticated Client with session
+                self._cli = easy_client(
+                    api_key=key,
+                    app_secret=secret,
+                    callback_url=callback_url,
+                    token_path=token_path
+                )  # :contentReference[oaicite:3]{index=3}
                 self._stream = StreamClient(self._cli)
                 self._use_schwab = True
-            except ImportError:
-                logger.warning("⚠️ Schwab SDK missing—falling back to yfinance")
+            except Exception as e:
+                logger.warning(
+                    "⚠️ Failed to initialize Schwab client, falling back to yfinance: %s",
+                    e
+                )
                 self._use_schwab = False
         else:
             logger.warning("⚠️ No Schwab creds—falling back to yfinance polling")
@@ -96,7 +115,7 @@ class DataAdapter:
         start = time.time()
         async for msg in self._stream.stream():
             ts = pd.Timestamp.now(tz="UTC")
-            q, depth = msg.get("quote",{}), msg.get("bookDepth",[])
+            q, depth = msg.get("quote", {}), msg.get("bookDepth", [])
             row = pd.DataFrame({
                 "Open":  [q.get("last")],
                 "High":  [q.get("last")],
@@ -176,11 +195,11 @@ class DataAdapter:
         dissipation = log_ret.pow(2)
 
         return pd.DataFrame({
-            "log_ret":   log_ret,
-            "ewma_vol":  ewma_vol,
-            "imbalance": imbalance,
-            "reynolds":  reynolds,
-            "vorticity": vorticity,
+            "log_ret":     log_ret,
+            "ewma_vol":    ewma_vol,
+            "imbalance":   imbalance,
+            "reynolds":    reynolds,
+            "vorticity":   vorticity,
             "dissipation": dissipation,
         }, index=df.index)
 
